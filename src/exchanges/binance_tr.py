@@ -14,6 +14,7 @@ from src.exchanges.base import BaseExchangeAutomation
 from src.browser.session import ExchangeSession
 from src.browser.manager import browser_manager
 from src.security.totp import generate_totp_code
+from src.captcha.browser_solver import auto_solve_geetest, setup_geetest_interception
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +144,9 @@ class BinanceTRAutomation(BaseExchangeAutomation):
             await self._debug_screenshot(page, "04_password_entered")
 
             # ── Step 3: Click submit ──
+            # Set up Geetest image interception before submit (captcha loads after)
+            await setup_geetest_interception(page)
+
             submit_btn = page.locator(
                 'button:has-text("Giriş Yap"), '
                 'button:has-text("Giriş yap"), '
@@ -154,28 +158,35 @@ class BinanceTRAutomation(BaseExchangeAutomation):
             await page.wait_for_timeout(4000)
             await self._debug_screenshot(page, "05_after_submit")
 
-            # ── Step 4: Handle captcha if present (loop for multiple rounds) ──
-            for captcha_round in range(3):
-                captcha_detected = await self._check_captcha_visible(page)
-                if not captcha_detected:
-                    break
-                await self._debug_screenshot(page, f"06_captcha_detected_round{captcha_round + 1}")
-                logger.info(f"BinanceTR: captcha detected (round {captcha_round + 1}) — waiting for human to solve")
-                solved = await session.wait_for_captcha_solved(timeout=300)
-                if not solved:
-                    token = session.get_auth_token()
-                    if token:
-                        session.set_logged_in(session.captured_tokens)
-                        await browser_manager.save_storage_state(self.exchange_name)
-                        return {"success": True, "message": "Login successful (detected after captcha)"}
-                    session.set_error("Captcha not solved in time")
-                    return {"success": False, "message": "Captcha not solved — open the frontend and solve the captcha"}
-                await page.wait_for_timeout(5000)
-                await self._debug_screenshot(page, f"07_after_captcha_round{captcha_round + 1}")
-                # Check if we advanced past login — if so, break out
+            # ── Step 4: Handle captcha if present ──
+            captcha_detected = await self._check_captcha_visible(page)
+            if captcha_detected:
+                await self._debug_screenshot(page, "06_captcha_detected")
+                logger.info("BinanceTR: captcha detected — attempting auto-solve")
+
+                # Try auto-solving with OpenCV (up to 3 puzzle attempts)
+                auto_solved = await auto_solve_geetest(page, max_attempts=3)
+                await self._debug_screenshot(page, "07_after_auto_solve")
+
+                if not auto_solved:
+                    # Fall back to human solving
+                    logger.info("BinanceTR: auto-solve failed — waiting for human to solve")
+                    solved = await session.wait_for_captcha_solved(timeout=300)
+                    if not solved:
+                        token = session.get_auth_token()
+                        if token:
+                            session.set_logged_in(session.captured_tokens)
+                            await browser_manager.save_storage_state(self.exchange_name)
+                            return {"success": True, "message": "Login successful (detected after captcha)"}
+                        session.set_error("Captcha not solved in time")
+                        return {"success": False, "message": "Captcha not solved — open the frontend and solve the captcha"}
+                    await page.wait_for_timeout(5000)
+
+                await self._debug_screenshot(page, "07b_after_captcha_resolved")
+
+                # Check if we advanced past login
                 if "/signin" not in page.url and "/login" not in page.url:
-                    logger.info(f"BinanceTR: advanced past login after captcha round {captcha_round + 1}")
-                    break
+                    logger.info("BinanceTR: advanced past login after captcha")
 
             # ── Step 5: TOTP (Google Authenticator) — comes right after captcha ──
             totp_secret = credentials.get("totp_secret")
