@@ -629,6 +629,10 @@ async def forward_click(exchange: str, req: ClickRequest):
         return {"success": False, "message": str(e)}
 
 
+# Store the last drag position per exchange for fine-tuning adjustments
+_last_drag: dict = {}  # exchange -> {start_x, start_y, end_x, end_y}
+
+
 class DragRequest(BaseModel):
     start_x: float
     start_y: float
@@ -686,22 +690,142 @@ async def forward_drag(exchange: str, req: DragRequest):
         await page.mouse.up()
         logger.info(f"Forwarded drag to {exchange} from ({req.start_x},{req.start_y}) to ({req.end_x},{req.end_y})")
 
+        # Store this drag position for adjustment fine-tuning
+        _last_drag[exchange] = {
+            "start_x": req.start_x,
+            "start_y": req.start_y,
+            "end_x": req.end_x,
+            "end_y": req.end_y,
+        }
+
         await page.wait_for_timeout(2500)
 
         # Check if captcha solved
         if session.get_auth_token():
             session.notify_captcha_solved()
+            _last_drag.pop(exchange, None)
             return {"success": True, "captcha_still_visible": False}
 
         current_url = page.url
         if "/login" not in current_url and "/account/login" not in current_url and "/giris" not in current_url and "/signin" not in current_url:
             session.notify_captcha_solved()
+            _last_drag.pop(exchange, None)
             return {"success": True, "captcha_still_visible": False}
 
         return {"success": True, "captcha_still_visible": True}
     except Exception as e:
         logger.error(f"Drag forwarding failed: {e}")
         return {"success": False, "message": str(e)}
+
+
+class AdjustRequest(BaseModel):
+    direction: str   # "left" or "right"
+    percent: float   # 1, 3, or 5
+
+
+@router.post("/api/captcha/{exchange}/adjust")
+async def adjust_drag(exchange: str, req: AdjustRequest):
+    """Re-drag the slider based on the last drag position, shifted by a percentage.
+
+    After a manual drag attempt, the user can fine-tune by selecting e.g.
+    '%1 sağa' (1% right) or '%3 sola' (3% left). The system re-drags from
+    the slider handle to (last_end_x ± percent% of track width).
+    """
+    last = _last_drag.get(exchange)
+    if not last:
+        return {"success": False, "message": "No previous drag to adjust from"}
+
+    session = get_session(exchange)
+    page = await session.get_page()
+
+    try:
+        import random
+        import math
+
+        # The drag distance from handle start to where user placed it
+        drag_distance = last["end_x"] - last["start_x"]
+
+        # Shift = percent of the total drag distance
+        # (using drag distance as the reference — the track width the slider travels)
+        shift = (req.percent / 100.0) * drag_distance
+        if req.direction == "left":
+            shift = -shift
+
+        new_end_x = last["end_x"] + shift
+        start_x = last["start_x"]
+        start_y = last["start_y"]
+
+        logger.info(
+            f"Captcha adjust {exchange}: {req.percent}% {req.direction} — "
+            f"last end_x={last['end_x']:.1f}, shift={shift:.1f}, new end_x={new_end_x:.1f}"
+        )
+
+        # Perform humanized drag from handle to new position
+        await page.mouse.move(start_x - random.uniform(5, 15), start_y + random.uniform(-5, 5))
+        await page.wait_for_timeout(random.randint(80, 200))
+        await page.mouse.move(start_x, start_y)
+        await page.wait_for_timeout(random.randint(100, 300))
+
+        await page.mouse.down()
+        await page.wait_for_timeout(random.randint(50, 150))
+
+        steps = max(25, 15)
+        for i in range(1, steps + 1):
+            t = i / steps
+            eased_t = 1 - (1 - t) ** 3
+
+            wobble_amplitude = 2.0 * math.sin(t * math.pi)
+            wobble_y = random.uniform(-wobble_amplitude, wobble_amplitude)
+
+            ix = start_x + (new_end_x - start_x) * eased_t
+            iy = start_y + wobble_y
+            await page.mouse.move(ix, iy)
+
+            if t < 0.15 or t > 0.85:
+                delay = random.randint(20, 50)
+            else:
+                delay = random.randint(8, 22)
+            await page.wait_for_timeout(delay)
+
+        await page.wait_for_timeout(random.randint(50, 200))
+        await page.mouse.up()
+        logger.info(f"Adjust drag complete: ({start_x:.0f},{start_y:.0f}) -> ({new_end_x:.0f},{start_y:.0f})")
+
+        # Update stored position
+        _last_drag[exchange] = {
+            "start_x": start_x,
+            "start_y": start_y,
+            "end_x": new_end_x,
+            "end_y": start_y,
+        }
+
+        await page.wait_for_timeout(2500)
+
+        # Check if captcha solved
+        if session.get_auth_token():
+            session.notify_captcha_solved()
+            _last_drag.pop(exchange, None)
+            return {"success": True, "captcha_still_visible": False}
+
+        current_url = page.url
+        if "/login" not in current_url and "/account/login" not in current_url and "/giris" not in current_url and "/signin" not in current_url:
+            session.notify_captcha_solved()
+            _last_drag.pop(exchange, None)
+            return {"success": True, "captcha_still_visible": False}
+
+        return {"success": True, "captcha_still_visible": True}
+    except Exception as e:
+        logger.error(f"Adjust drag failed: {e}")
+        return {"success": False, "message": str(e)}
+
+
+@router.get("/api/captcha/{exchange}/last-drag")
+async def get_last_drag(exchange: str):
+    """Return the last drag position for an exchange (for UI display)."""
+    last = _last_drag.get(exchange)
+    if not last:
+        return {"has_last_drag": False}
+    return {"has_last_drag": True, **last}
 
 
 class TypeRequest(BaseModel):
