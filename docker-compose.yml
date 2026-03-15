@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  exchange-automation:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: exchange-automation
+    env_file:
+      - ../cryptohub_turhost/.env
+    environment:
+      - DATABASE_URL=postgresql://cryptohub:${DB_PASSWORD}@db:5432/cryptohub
+      - PORT=4000
+      - IMAP_SERVER=${IMAP_SERVER:-}
+      - IMAP_PORT=${IMAP_PORT:-993}
+      - IMAP_EMAIL=${IMAP_EMAIL:-}
+      - IMAP_PASSWORD=${IMAP_PASSWORD:-}
+      - IMAP_ENABLED=${IMAP_ENABLED:-false}
+    expose:
+      - "4000"
+    volumes:
+      - ./src:/app/src
+      - ./logs:/app/logs
+      - ./data:/app/data
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    restart: unless-stopped
+
+networks:
+  default:
+    external: true
+    name: cryptohub_turhost_default
